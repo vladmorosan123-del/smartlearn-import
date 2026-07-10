@@ -14,7 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { listSelectable, materialize } = require('./source');
-const { chatSelect } = require('./chat');
+const { chatSelect, refineByMessage } = require('./chat');
 const { parseFilename } = require('./parseFilename');
 const { mapToMaterial } = require('./pipeline');
 
@@ -23,6 +23,8 @@ app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
 const PREVIEW_ROOT = path.join(process.cwd(), '_import_preview');
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 
 // cache pe URL: lista selectabila (ca sa nu re-descarcam pagina la fiecare mesaj)
 const pageCache = new Map(); // url -> { sel, ts }
@@ -36,14 +38,26 @@ async function getSelectable(url) {
   return sel;
 }
 
+function inferSubject(name, p) {
+  if (p && p.materieSlug) return p.materieSlug;
+  const n = name.toLowerCase();
+  if (/fizica|fizic/.test(n)) return 'fizica';
+  if (/informatica|info/.test(n)) return 'informatica';
+  if (/romana|literatura/.test(n)) return 'romana';
+  return 'matematica';
+}
 function toMaterial(name, previewUrl) {
   const p = parseFilename(name);
-  if (p) {
-    const row = mapToMaterial(p, {});
-    return { title: row.title, file_name: name, tip: row._tip, profil: p.profil, year: p.an, previewUrl };
-  }
-  const tip = /(barem|_bar_|\bbar\b|solut|rezolvar|answer)/i.test(name) ? 'barem' : 'subiect';
-  return { title: name.replace(/\.pdf$/i, ''), file_name: name, tip, profil: null, year: null, previewUrl };
+  const tip = p ? mapToMaterial(p, {})._tip : (/(barem|_bar_|\bbar\b|solut|rezolvar|answer)/i.test(name) ? 'barem' : 'subiect');
+  const title = p ? mapToMaterial(p, {}).title : name.replace(/\.pdf$/i, '');
+  return {
+    title, file_name: name, tip,
+    profil: p ? p.profil : null,
+    year: p ? p.an : null,
+    subject: inferSubject(name, p),
+    category: 'bac_model',
+    previewUrl,
+  };
 }
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', mode: 'import-chat' }));
@@ -57,27 +71,78 @@ app.post('/api/import/chat', async (req, res) => {
       return res.json({ reply: 'Pe pagina asta nu am găsit fișiere de descărcat (subiecte/bareme). Verifică linkul.', materials: [], found: 0 });
     }
 
-    const { reply, ids } = await chatSelect(sel.items, String(message), history || []);
-    if (!ids.length) return res.json({ reply, materials: [], found: sel.items.length });
+    const { ids } = await chatSelect(sel.items, String(message), history || []);
+    if (!ids.length) {
+      return res.json({ reply: 'Nu am găsit fișiere care să se potrivească. Reformulează (ex: „modelele de matematică mate-info").', materials: [], found: sel.items.length });
+    }
+
+    // extinde selectia in fisiere, apoi filtreaza FIN dupa mesaj (profil/tip/limita)
+    const files = await materialize(sel, ids);
+    let prelim = files.map((f) => ({ f, m: toMaterial(f.name, '') }));
+    const keptNames = new Set(refineByMessage(prelim.map((x) => x.m), String(message)).map((m) => m.file_name));
+    prelim = prelim.filter((x) => keptNames.has(x.m.file_name));
+
+    if (!prelim.length) {
+      return res.json({ reply: 'Am găsit fișiere, dar niciunul nu se potrivește exact cererii. Încearcă altă formulare.', materials: [], found: sel.items.length });
+    }
 
     const session = crypto.randomBytes(6).toString('hex');
     const dest = path.join(PREVIEW_ROOT, session);
     fs.mkdirSync(dest, { recursive: true });
-
-    const files = await materialize(sel, ids);
     const materials = [];
-    for (const f of files) {
+    for (const { f, m } of prelim) {
       const bytes = await f.getBytes();
       fs.writeFileSync(path.join(dest, f.name), bytes);
-      materials.push(toMaterial(f.name, `/api/import/file/${session}/${encodeURIComponent(f.name)}`));
+      m.previewUrl = `/api/import/file/${session}/${encodeURIComponent(f.name)}`;
+      materials.push(m);
     }
-    // reply cu numarul REAL de fisiere pregatite (dupa extinderea ZIP-urilor)
     const s = materials.filter((m) => m.tip === 'subiect').length;
     const b = materials.filter((m) => m.tip === 'barem').length;
-    const finalReply = materials.length
-      ? `Am pregătit ${materials.length} fișiere${b ? ` (${s} subiecte, ${b} bareme)` : ''}. Verifică-le mai jos și confirmă importul.`
-      : reply;
-    res.json({ reply: finalReply, materials, found: sel.items.length });
+    const finalReply = `Am pregătit ${materials.length} fișiere${b ? ` (${s} subiecte, ${b} bareme)` : ''}. Verifică-le mai jos și confirmă importul.`;
+    res.json({ session, reply: finalReply, materials, found: sel.items.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// SCRIERE REALA: upload in storage + insert in `materials`. Confirmata din UI.
+app.post('/api/import/commit', async (req, res) => {
+  const { session, materials } = req.body || {};
+  if (!session || !Array.isArray(materials) || !materials.length) return res.status(400).json({ error: 'Trebuie session si materials.' });
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return res.status(500).json({ error: 'Supabase neconfigurat (SUPABASE_URL / SUPABASE_ANON_KEY).' });
+
+  const dir = path.join(PREVIEW_ROOT, path.basename(String(session)));
+  const H = { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` };
+  try {
+    const imported = [];
+    for (const m of materials) {
+      const file = path.join(dir, path.basename(m.file_name));
+      if (!fs.existsSync(file)) throw new Error(`Fisier lipsa in sesiune: ${m.file_name}`);
+      const bytes = fs.readFileSync(file);
+
+      const destPath = `${m.category || 'bac_model'}/${m.subject || 'matematica'}/${m.file_name}`;
+      const up = await fetch(`${SUPABASE_URL}/storage/v1/object/materials/${encodeURI(destPath)}`, {
+        method: 'POST',
+        headers: { ...H, 'Content-Type': 'application/pdf', 'x-upsert': 'true' },
+        body: bytes,
+      });
+      if (!up.ok) throw new Error(`upload ${m.file_name}: ${up.status} ${await up.text()}`);
+      const fileUrl = `${SUPABASE_URL}/storage/v1/object/public/materials/${destPath}`;
+
+      const row = {
+        title: m.title, subject: m.subject || 'matematica', category: m.category || 'bac_model',
+        year: m.year || null, file_name: m.file_name, file_type: 'application/pdf',
+        file_size: bytes.length, file_url: fileUrl,
+      };
+      const ins = await fetch(`${SUPABASE_URL}/rest/v1/materials`, {
+        method: 'POST',
+        headers: { ...H, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+        body: JSON.stringify(row),
+      });
+      if (!ins.ok) throw new Error(`insert ${m.file_name}: ${ins.status} ${await ins.text()}`);
+      imported.push(m.file_name);
+    }
+    res.json({ ok: true, imported: imported.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
