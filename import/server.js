@@ -14,7 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { listSelectable, materialize } = require('./source');
-const { chatSelect, refineByMessage } = require('./chat');
+const { coarsePick, aiRefine } = require('./chat');
 const { parseFilename } = require('./parseFilename');
 const { mapToMaterial } = require('./pipeline');
 
@@ -71,34 +71,39 @@ app.post('/api/import/chat', async (req, res) => {
       return res.json({ reply: 'Pe pagina asta nu am găsit fișiere de descărcat (subiecte/bareme). Verifică linkul.', materials: [], found: 0 });
     }
 
-    const { ids } = await chatSelect(sel.items, String(message), history || []);
+    // COARSE (materie/an): ce arhive/fisiere aducem
+    const ids = coarsePick(sel.items, String(message));
     if (!ids.length) {
-      return res.json({ reply: 'Nu am găsit fișiere care să se potrivească. Reformulează (ex: „modelele de matematică mate-info").', materials: [], found: sel.items.length });
+      return res.json({ reply: 'Spune-mi materia (ex: „modelele de matematică", „subiectele de fizică") ca să știu ce să deschid.', materials: [], found: sel.items.length });
     }
 
-    // extinde selectia in fisiere, apoi filtreaza FIN dupa mesaj (profil/tip/limita)
+    // aduce fisierele reale, apoi AI-ul alege exact ce se potriveste cererii
     const files = await materialize(sel, ids);
-    let prelim = files.map((f) => ({ f, m: toMaterial(f.name, '') }));
-    const keptNames = new Set(refineByMessage(prelim.map((x) => x.m), String(message)).map((m) => m.file_name));
-    prelim = prelim.filter((x) => keptNames.has(x.m.file_name));
+    if (!files.length) return res.json({ reply: 'N-am putut extrage fișiere din sursa asta.', materials: [], found: sel.items.length });
+    const byName = new Map(files.map((f) => [f.name, f]));
+    const prelim = files.map((f) => toMaterial(f.name, ''));
 
-    if (!prelim.length) {
-      return res.json({ reply: 'Am găsit fișiere, dar niciunul nu se potrivește exact cererii. Încearcă altă formulare.', materials: [], found: sel.items.length });
+    const { reply: aiReply, chosen } = await aiRefine(prelim, String(message), history || []);
+    if (!chosen.length) {
+      return res.json({ reply: 'Am găsit fișiere, dar niciunul nu se potrivește exact cererii tale. Încearcă altă formulare.', materials: [], found: sel.items.length });
     }
 
     const session = crypto.randomBytes(6).toString('hex');
     const dest = path.join(PREVIEW_ROOT, session);
     fs.mkdirSync(dest, { recursive: true });
     const materials = [];
-    for (const { f, m } of prelim) {
+    for (const m of chosen) {
+      const f = byName.get(m.file_name);
+      if (!f) continue;
       const bytes = await f.getBytes();
-      fs.writeFileSync(path.join(dest, f.name), bytes);
-      m.previewUrl = `/api/import/file/${session}/${encodeURIComponent(f.name)}`;
+      fs.writeFileSync(path.join(dest, m.file_name), bytes);
+      m.previewUrl = `/api/import/file/${session}/${encodeURIComponent(m.file_name)}`;
       materials.push(m);
     }
     const s = materials.filter((m) => m.tip === 'subiect').length;
     const b = materials.filter((m) => m.tip === 'barem').length;
-    const finalReply = `Am pregătit ${materials.length} fișiere${b ? ` (${s} subiecte, ${b} bareme)` : ''}. Verifică-le mai jos și confirmă importul.`;
+    const countLine = `${materials.length} fișiere${b ? ` (${s} subiecte, ${b} bareme)` : ''}`;
+    const finalReply = aiReply ? `${aiReply} — ${countLine}. Verifică și confirmă.` : `Am pregătit ${countLine}. Verifică și confirmă.`;
     res.json({ session, reply: finalReply, materials, found: sel.items.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
