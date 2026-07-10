@@ -4,21 +4,19 @@
 //
 //   node import/index.js <url> "<instructiune>" [optiuni]
 //
+// <url> poate fi ORICE link oficial: un .zip, un .pdf, sau o pagina-index
+// care listeaza .pdf-uri / .zip-uri.
+//
 // Optiuni:
 //   --ai        foloseste Gemini pt interpretarea instructiunii (fallback determinist)
 //   --out FILE  salveaza planul JSON si in FILE
-//   --write --confirm   SCRIERE REALA (upload + insert). DEZACTIVAT implicit; necesita AMBELE.
-//
-// Exemplu:
-//   node import/index.js \
-//     "https://subiecte.edu.ro/2026/bacalaureat/modeledesubiecte/probescrise/" \
-//     "importa toate modelele de matematica"
+//   --write --confirm   SCRIERE REALA (upload + insert). DEZACTIVAT implicit.
 
 const fs = require('fs');
 const path = require('path');
 const { interpretInstruction } = require('./interpretInstruction');
 const { parseFilename } = require('./parseFilename');
-const { resolveZipUrl, fetchBuffer, listPdfEntries, extractPdf } = require('./source');
+const { gatherFiles } = require('./source');
 const { filterFiles, sortPairs, mapToMaterial } = require('./pipeline');
 
 const DRY_DIR = path.join(process.cwd(), '_import_dryrun');
@@ -39,6 +37,47 @@ function parseArgs(argv) {
   return args;
 }
 
+// Nucleul reutilizabil (folosit si de serverul HTTP pentru UI-ul profesorului).
+// Returneaza planul; daca dest e dat, extrage PDF-urile acolo.
+async function buildPlan(url, instruction, { useAI = false, dest = null } = {}) {
+  const filter = await interpretInstruction(instruction, { useAI });
+  const { files, source } = await gatherFiles(url, filter.materie);
+
+  const parsed = files
+    .map((f) => {
+      const p = parseFilename(f.name);
+      if (p) p._file = f;
+      return p;
+    })
+    .filter(Boolean);
+
+  const kept = sortPairs(filterFiles(parsed, filter));
+
+  const rows = [];
+  for (const p of kept) {
+    let fileUrl = null;
+    if (dest) {
+      fs.mkdirSync(dest, { recursive: true });
+      const bytes = await p._file.getBytes();
+      const out = path.join(dest, p.fileName);
+      fs.writeFileSync(out, bytes);
+      fileUrl = path.relative(process.cwd(), out);
+    }
+    const row = mapToMaterial(p, { fileUrl });
+    row._getBytes = p._file.getBytes; // pt scrierea reala (nu se serializeaza)
+    rows.push(row);
+  }
+
+  const subiecte = rows.filter((r) => r._tip === 'subiect').length;
+  const bareme = rows.filter((r) => r._tip === 'barem').length;
+  return {
+    source,
+    filter,
+    summary: { candidate: files.length, matched: rows.length, subiecte, bareme },
+    materials: rows,
+  };
+}
+
 async function run(argv) {
   const args = parseArgs(argv);
   if (!args.url || !args.instruction) {
@@ -49,56 +88,35 @@ async function run(argv) {
   const isWrite = args.write && args.confirm;
   console.error(`\n[mod] ${isWrite ? 'SCRIERE REALA' : 'DRY-RUN (fara scriere in DB/storage)'}`);
 
-  // 1) Interpreteaza instructiunea -> filtru
-  const filter = await interpretInstruction(args.instruction, { useAI: args.ai });
-  console.error('[filtru]', JSON.stringify(filter));
+  const plan = await buildPlan(args.url, args.instruction, {
+    useAI: args.ai,
+    dest: isWrite ? null : DRY_DIR,
+  });
+  console.error('[filtru]', JSON.stringify(plan.filter));
+  console.error('[sursa]', plan.source);
+  console.error(`[gasit] ${plan.summary.candidate} candidate -> ${plan.summary.matched} potrivite`);
 
-  // 2) Gaseste + descarca ZIP-ul de modele
-  const zipUrl = await resolveZipUrl(args.url, filter.materie);
-  console.error('[zip]', zipUrl);
-  const zipBuffer = await fetchBuffer(zipUrl);
-
-  // 3) Listeaza PDF-urile, deduce metadate, filtreaza, ordoneaza
-  const entries = listPdfEntries(zipBuffer);
-  const parsed = entries.map((e) => parseFilename(e.name)).filter(Boolean);
-  const kept = sortPairs(filterFiles(parsed, filter));
-
-  console.error(`[gasit] ${entries.length} PDF in ZIP -> ${kept.length} potrivite filtrului`);
-
-  // 4) Descarca local (dry-run) + construieste randurile
-  fs.mkdirSync(DRY_DIR, { recursive: true });
-  const rows = [];
-  for (const p of kept) {
-    const entry = entries.find((e) => e.name === p.fileName);
-    let fileUrl = null;
-    if (!isWrite) {
-      const { dest } = extractPdf(zipBuffer, entry.entryName, DRY_DIR);
-      fileUrl = path.relative(process.cwd(), dest);
-    }
-    rows.push(mapToMaterial(p, { fileUrl }));
-  }
-
-  // 5) Raport
-  const subiecte = rows.filter((r) => r._tip === 'subiect').length;
-  const bareme = rows.filter((r) => r._tip === 'barem').length;
   const report = {
     mode: isWrite ? 'write' : 'dry-run',
-    source: zipUrl,
-    filter,
-    summary: { pdfInZip: entries.length, matched: rows.length, subiecte, bareme },
-    materials: rows,
+    source: plan.source,
+    filter: plan.filter,
+    summary: plan.summary,
+    materials: plan.materials.map(({ _getBytes, ...r }) => r),
   };
   const json = JSON.stringify(report, null, 2);
   console.log(json);
   if (args.out) fs.writeFileSync(args.out, json);
-  fs.writeFileSync(path.join(DRY_DIR, 'plan.json'), json);
+  if (!isWrite) {
+    fs.mkdirSync(DRY_DIR, { recursive: true });
+    fs.writeFileSync(path.join(DRY_DIR, 'plan.json'), json);
+  }
 
   if (isWrite) {
     const { writeMaterials } = require('./write');
-    await writeMaterials(rows, zipBuffer, entries);
+    await writeMaterials(plan.materials);
   } else {
-    console.error(`\n[ok] ${rows.length} fisiere descarcate in ${DRY_DIR}/ . NIMIC nu s-a scris in DB/storage.`);
-    console.error('     Pentru scriere reala (dupa verificare): adauga --write --confirm.');
+    console.error(`\n[ok] ${report.summary.matched} fisiere descarcate in ${DRY_DIR}/ . NIMIC nu s-a scris in DB/storage.`);
+    console.error('     Pentru scriere reala (dupa verificare): --write --confirm + IMPORT_ALLOW_PROD_WRITE=yes');
   }
   return report;
 }
@@ -110,4 +128,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { run, parseArgs };
+module.exports = { run, parseArgs, buildPlan };

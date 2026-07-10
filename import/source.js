@@ -1,16 +1,17 @@
 'use strict';
 
-// Acces la sursa oficiala (subiecte.edu.ro): modelele de subiecte sunt
-// impachetate ca ZIP per materie (ex. Bac_2026_E_c_Matematica_modele.zip).
-// Aici: gaseste ZIP-ul potrivit, il descarca si listeaza / extrage PDF-urile.
+// Acces la o sursa oficiala, dintr-un link ARBITRAR:
+//   - un .zip direct (ex. arhiva de modele per materie)
+//   - un .pdf direct
+//   - o pagina-index care listeaza .pdf-uri directe SAU .zip-uri per materie
+// Returneaza fisiere candidate uniforme: { name, getBytes(), sourceUrl }.
 
-const fs = require('fs');
 const path = require('path');
 const AdmZip = require('adm-zip');
 
 const UA = 'Mozilla/5.0 (SmartLearning import bot)';
 
-// Cuvantul-cheie din numele ZIP-ului, pe materie.
+// cuvant-cheie din numele ZIP-ului, pe materie (ca sa alegem arhiva corecta)
 const ZIP_KEYWORD = {
   matematica: 'matematica',
   informatica: 'informatica',
@@ -37,40 +38,76 @@ async function fetchBuffer(url) {
   return Buffer.from(await r.arrayBuffer());
 }
 
-// Din pagina-index gaseste ZIP-ul de modele pentru materia ceruta.
-async function resolveZipUrl(startUrl, subjectSlug) {
-  if (/\.zip($|\?)/i.test(startUrl)) return startUrl;
-
-  const html = await fetchText(startUrl);
-  const hrefs = [...html.matchAll(/href="([^"]+\.zip)"/gi)].map((m) => m[1]);
-  const key = ZIP_KEYWORD[subjectSlug] || subjectSlug || '';
-  const wantModel = (h) => /model/.test(normalize(h));
-
-  // preferam ZIP-ul care contine materia SI "model"
-  let hit =
-    hrefs.find((h) => normalize(h).includes(key) && wantModel(h)) ||
-    hrefs.find((h) => normalize(h).includes(key));
-
-  if (!hit) throw new Error(`Nu am gasit ZIP pentru "${subjectSlug}" in ${startUrl}`);
-  return new URL(hit, startUrl).href;
+function uniq(arr) {
+  return [...new Set(arr)];
 }
 
-function listPdfEntries(zipBuffer) {
+function baseName(u) {
+  try {
+    return decodeURIComponent(path.posix.basename(new URL(u).pathname));
+  } catch {
+    return decodeURIComponent(path.posix.basename(u));
+  }
+}
+
+function directFile(url) {
+  return { name: baseName(url), getBytes: () => fetchBuffer(url), sourceUrl: url };
+}
+
+function zipToFiles(zipBuffer, sourceUrl) {
   const zip = new AdmZip(zipBuffer);
   return zip
     .getEntries()
     .filter((e) => !e.isDirectory && /\.pdf$/i.test(e.entryName))
-    .map((e) => ({ name: path.posix.basename(e.entryName), entryName: e.entryName }));
+    .map((e) => ({
+      name: path.posix.basename(e.entryName),
+      getBytes: async () => zip.getEntry(e.entryName).getData(),
+      sourceUrl,
+    }));
 }
 
-function extractPdf(zipBuffer, entryName, destDir) {
-  const zip = new AdmZip(zipBuffer);
-  const entry = zip.getEntry(entryName);
-  if (!entry) throw new Error(`Lipsa in ZIP: ${entryName}`);
-  fs.mkdirSync(destDir, { recursive: true });
-  const dest = path.join(destDir, path.posix.basename(entryName));
-  fs.writeFileSync(dest, entry.getData());
-  return { dest, size: entry.header.size };
+// Aduna fisierele candidate dintr-un link arbitrar.
+async function gatherFiles(startUrl, subjectSlug) {
+  // 1) .zip direct
+  if (/\.zip($|\?)/i.test(startUrl)) {
+    const buf = await fetchBuffer(startUrl);
+    return { files: zipToFiles(buf, startUrl), source: startUrl };
+  }
+  // 2) .pdf direct
+  if (/\.pdf($|\?)/i.test(startUrl)) {
+    return { files: [directFile(startUrl)], source: startUrl };
+  }
+
+  // 3) pagina-index: cauta .pdf-uri directe si .zip-uri
+  const html = await fetchText(startUrl);
+  const pdfLinks = uniq([...html.matchAll(/href="([^"]+\.pdf)"/gi)].map((m) => m[1]));
+  const zipLinks = uniq([...html.matchAll(/href="([^"]+\.zip)"/gi)].map((m) => m[1]));
+
+  if (pdfLinks.length) {
+    return {
+      files: pdfLinks.map((h) => directFile(new URL(h, startUrl).href)),
+      source: startUrl,
+    };
+  }
+
+  if (zipLinks.length) {
+    const key = ZIP_KEYWORD[subjectSlug] || (subjectSlug || '');
+    let picks = key ? zipLinks.filter((h) => normalize(h).includes(key)) : zipLinks;
+    if (key && !picks.length) {
+      throw new Error(`Nu am gasit arhiva ZIP pentru "${subjectSlug}" la ${startUrl} (gasite ${zipLinks.length} ZIP-uri).`);
+    }
+    let files = [];
+    const srcs = [];
+    for (const h of picks) {
+      const url = new URL(h, startUrl).href;
+      const buf = await fetchBuffer(url);
+      files = files.concat(zipToFiles(buf, url));
+      srcs.push(url);
+    }
+    return { files, source: srcs.join(', ') };
+  }
+
+  throw new Error(`Niciun .pdf sau .zip gasit la ${startUrl}.`);
 }
 
-module.exports = { resolveZipUrl, fetchBuffer, listPdfEntries, extractPdf };
+module.exports = { gatherFiles, fetchBuffer };

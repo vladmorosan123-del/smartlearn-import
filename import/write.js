@@ -1,12 +1,8 @@
 'use strict';
 
 // SCRIERE REALA in Supabase (storage + tabel `materials`).
-// Se apeleaza DOAR din index.js cu --write --confirm SI necesita in plus
-// variabila de mediu IMPORT_ALLOW_PROD_WRITE=yes. Triplu blocaj intentionat:
-// pana la validarea dry-run, aceasta functie NU trebuie rulata.
-
-const path = require('path');
-const AdmZip = require('adm-zip');
+// Triplu blocaj intentionat: --write + --confirm + IMPORT_ALLOW_PROD_WRITE=yes.
+// Pana la validarea dry-run, NU trebuie rulata.
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
@@ -43,23 +39,19 @@ async function insertMaterial(row) {
   return r.json();
 }
 
-async function writeMaterials(rows, zipBuffer, entries) {
+async function writeMaterials(rows) {
   if (process.env.IMPORT_ALLOW_PROD_WRITE !== 'yes') {
-    throw new Error(
-      'Scriere reala blocata. Seteaza IMPORT_ALLOW_PROD_WRITE=yes (in plus fata de --write --confirm) ca sa scrii in productie.',
-    );
+    throw new Error('Scriere reala blocata. Seteaza IMPORT_ALLOW_PROD_WRITE=yes (in plus fata de --write --confirm).');
   }
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) throw new Error('SUPABASE_URL / SUPABASE_ANON_KEY lipsesc');
 
-  const zip = new AdmZip(zipBuffer);
   const inserted = [];
   for (const row of rows) {
-    const entry = entries.find((e) => e.name === row.file_name);
-    const bytes = zip.getEntry(entry.entryName).getData();
+    const bytes = await row._getBytes();
     const destPath = `bac_model/${row.subject}/${row.file_name}`;
     const publicUrl = await uploadPdf(bytes, destPath);
 
-    const { _tip, ...clean } = row; // _tip nu e coloana in DB
+    const { _tip, _getBytes, ...clean } = row; // campuri ne-DB
     clean.file_url = publicUrl;
     clean.file_type = 'application/pdf';
     clean.file_size = bytes.length;

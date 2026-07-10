@@ -1,0 +1,7 @@
+node_modules/
+.env
+*.log
+PENTRU-RENDER.txt
+RENDER-PASTE.txt
+_import_dryrun/
+_import_preview/
