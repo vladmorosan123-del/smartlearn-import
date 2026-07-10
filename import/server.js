@@ -42,7 +42,8 @@ function toMaterial(name, previewUrl) {
     const row = mapToMaterial(p, {});
     return { title: row.title, file_name: name, tip: row._tip, profil: p.profil, year: p.an, previewUrl };
   }
-  return { title: name.replace(/\.pdf$/i, ''), file_name: name, tip: /barem|_bar_/i.test(name) ? 'barem' : 'subiect', profil: null, year: null, previewUrl };
+  const tip = /(barem|_bar_|\bbar\b|solut|rezolvar|answer)/i.test(name) ? 'barem' : 'subiect';
+  return { title: name.replace(/\.pdf$/i, ''), file_name: name, tip, profil: null, year: null, previewUrl };
 }
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', mode: 'import-chat' }));
