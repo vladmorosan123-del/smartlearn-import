@@ -1,5 +1,7 @@
 'use strict';
 
+require('dotenv').config();
+
 // Server HTTP pentru UI-ul profesorului. DRY-RUN (preview) — nu scrie in DB.
 //   POST /api/import/chat  { url, message, history } -> { reply, materials }
 //   GET  /api/import/file/:session/:name              -> serveste un PDF descarcat

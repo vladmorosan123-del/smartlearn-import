@@ -47,6 +47,15 @@ async function fetchResource(url) {
   };
 }
 
+// numele real al unui fisier fara extensie in URL (din Content-Disposition), cu un GET minimal
+async function resolveName(href) {
+  try {
+    const r = await fetch(href, { headers: { 'User-Agent': UA, Range: 'bytes=0-0' }, redirect: 'follow' });
+    const name = nameFromDisposition(r.headers.get('content-disposition') || '', null);
+    return name && /\.(pdf|zip|docx?)$/i.test(name) ? name : null;
+  } catch { return null; }
+}
+
 function isPdf(ct, url) { return ct.includes('pdf') || /\.pdf($|\?)/i.test(url); }
 function isZip(ct, url, cd) { return ct.includes('zip') || /\.zip($|\?)/i.test(url) || /\.zip/i.test(cd); }
 
@@ -102,16 +111,27 @@ async function listSelectable(url) {
 
   // pagina HTML -> linkuri de descarcare
   const html = res.buffer.toString('utf8');
-  const links = extractLinks(html, res.finalUrl);
+  let links = extractLinks(html, res.finalUrl);
+  // scoate butoanele bulk / non-fisier
+  links = links.filter((l) => !/download selected|selectate|select all|adaug/i.test(l.label));
+
   const items = [];
   const _resolve = {};
-  links.forEach((l, i) => {
-    const id = `l${i}`;
-    const kind = /\.zip($|\?)/i.test(l.href) ? 'zip' : 'file';
-    items.push({ id, label: l.label, kind });
-    _resolve[id] = { kind, href: l.href, label: l.label };
-  });
-  return { source: url, items, _resolve };
+  await Promise.all(
+    links.slice(0, 30).map(async (l, i) => {
+      let label = l.label;
+      // daca linkul nu are extensie de fisier in URL, ia numele real din Content-Disposition
+      if (!/\.(pdf|zip|docx?)($|\?)/i.test(l.href)) {
+        const real = await resolveName(l.href);
+        if (real) label = real;
+      }
+      const kind = /\.zip($|\?)/i.test(l.href) || /\.zip$/i.test(label) ? 'zip' : 'file';
+      const id = `l${i}`;
+      items[i] = { id, label, kind };
+      _resolve[id] = { kind, href: l.href, label };
+    }),
+  );
+  return { source: url, items: items.filter(Boolean), _resolve };
 }
 
 // Descarca/extrage efectiv doar elementele alese (dupa id).
