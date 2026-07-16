@@ -64,7 +64,15 @@ function enumerateVariants(pdfLinks, max = 120) {
 }
 
 async function fetchResource(url) {
-  const r = await fetch(url, { headers: BROWSER_HEADERS, redirect: 'follow' });
+  let r;
+  try {
+    r = await fetch(url, { headers: BROWSER_HEADERS, redirect: 'follow' });
+  } catch (e) {
+    // scoate cauza reala din spatele "fetch failed" (TLS, timeout, refuz conexiune, geo)
+    const c = e && e.cause;
+    const detail = c ? (c.code || c.reason || c.message || String(c)) : (e && e.message);
+    throw new Error(`FETCH ${url} -> ${e && e.message}${detail && detail !== (e && e.message) ? ' | cauza: ' + detail : ''}`);
+  }
   if (!r.ok) throw new Error(`GET ${url} -> ${r.status}`);
   const buffer = Buffer.from(await r.arrayBuffer());
   return {
