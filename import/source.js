@@ -35,6 +35,27 @@ function stripTags(html) {
   return html.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+// respecta tag-ul <base href="..."> (schimba rezolvarea linkurilor relative)
+function baseHref(html, fallback) {
+  const m = html.match(/<base[^>]*href="([^"]+)"/i);
+  if (m) { try { return new URL(m[1], fallback).href; } catch { /* noop */ } }
+  return fallback;
+}
+
+// Site-uri unde grila de variante e randata prin JS, dar PDF-urile au URL numerotat
+// predictibil (ex: ..._si_002.pdf). Din URL-ul unei variante generam Varianta 1..max.
+function enumerateVariants(pdfLinks, max = 120) {
+  const pdf = pdfLinks.find((l) => /(\d+)\.pdf(\?|$)/i.test(l.href));
+  if (!pdf) return null;
+  const m = pdf.href.match(/(\d+)(\.pdf)(\?|$)/i);
+  const pad = m[1].length;
+  const start = pdf.href.slice(0, m.index);
+  const end = pdf.href.slice(m.index + m[1].length);
+  const out = [];
+  for (let n = 1; n <= max; n++) out.push({ url: `${start}${String(n).padStart(pad, '0')}${end}`, num: n });
+  return out;
+}
+
 async function fetchResource(url) {
   const r = await fetch(url, { headers: { 'User-Agent': UA }, redirect: 'follow' });
   if (!r.ok) throw new Error(`GET ${url} -> ${r.status}`);
@@ -111,7 +132,8 @@ async function listSelectable(url) {
 
   // pagina HTML -> linkuri de descarcare
   const html = res.buffer.toString('utf8');
-  let links = extractLinks(html, res.finalUrl);
+  const effBase = baseHref(html, res.finalUrl);
+  let links = extractLinks(html, effBase);
   // scoate butoanele bulk / non-fisier
   links = links.filter((l) => !/download selected|selectate|select all|adaug/i.test(l.label));
 
@@ -131,7 +153,66 @@ async function listSelectable(url) {
       _resolve[id] = { kind, href: l.href, label };
     }),
   );
+
+  // sub-pagini de continut (liste pe ani/sesiuni) — se urmaresc la materializare
+  extractSubPages(html, effBase).slice(0, 40).forEach((s, i) => {
+    const id = `p${i}`;
+    items.push({ id, label: s.label, kind: 'page' });
+    _resolve[id] = { kind: 'page', href: s.href, label: s.label };
+  });
+
+  // Grila de variante randata prin JS: putine PDF-uri directe -> enumeram dupa pattern-ul URL.
+  const pdfLinks = links.filter((l) => /\.pdf(\?|$)/i.test(l.href));
+  if (pdfLinks.length && pdfLinks.length <= 3) {
+    const enumd = enumerateVariants(pdfLinks);
+    if (enumd) {
+      const existing = new Set(links.map((l) => l.href));
+      enumd.forEach((v, i) => {
+        if (existing.has(v.url)) return;
+        const id = `v${i}`;
+        items.push({ id, label: `Varianta ${v.num}`, kind: 'file' });
+        _resolve[id] = { kind: 'file', href: v.url, label: `Varianta ${v.num}`, tolerant: true };
+      });
+    }
+  }
+
   return { source: url, items: items.filter(Boolean), _resolve };
+}
+
+// Sub-pagini de continut (ex: liste pe ani) — linkuri mai adanci, non-fisier.
+const NAV_JUNK = /(wp-|\/feed|\/category|\/tag\/|\/author|\/page\/|xmlrpc|\/comment|\/login|\/cart|\/cos|\/contact|\/despre|privacy|cookie|\/wp-json|\/account|\/abonament)/i;
+const CONTENT_HINT = /(19|20)\d{2}|\bbac\b|variant|model|subiect|barem|simular|sesiun|teste/i;
+
+function extractSubPages(html, baseUrl) {
+  let base;
+  try { base = new URL(baseUrl); } catch { return []; }
+  const basePath = base.pathname.replace(/\/+$/, '');
+  const out = [];
+  const seen = new Set();
+  const re = /<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(html))) {
+    const raw = m[1];
+    if (/^(#|javascript:|mailto:|tel:)/i.test(raw)) continue;
+    if (/\.(pdf|zip|docx?|png|jpe?g|gif|svg|css|js|ico|webp)($|\?)/i.test(raw) || /\/file(\/|$|\?)/i.test(raw)) continue;
+    let u;
+    try { u = new URL(raw, baseUrl); } catch { continue; }
+    if (u.host !== base.host) continue;
+    if (NAV_JUNK.test(u.pathname)) continue;
+    const p = u.pathname.replace(/\/+$/, '');
+    if (!p || p === basePath) continue; // radacina goala / pagina curenta
+    const text = stripTags(m[2]).slice(0, 100);
+    // sub-pagina = mai adanca decat pagina curenta SAU link de continut (an/bac/variante) oriunde
+    const deeper = p.startsWith(`${basePath}/`) && p.length > basePath.length + 1;
+    if (!deeper && !CONTENT_HINT.test(`${text} ${p}`)) continue;
+    const seg = p.split('/').filter(Boolean).pop() || '';
+    // eticheta: textul daca e informativ (are an/bac), altfel segmentul din URL
+    const label = /(19|20)\d{2}|bac|variant|model/i.test(text) ? text : (seg || text || baseName(u.href));
+    if (seen.has(u.href)) continue;
+    seen.add(u.href);
+    out.push({ href: u.href, label });
+  }
+  return out;
 }
 
 // Descarca/extrage efectiv doar elementele alese (dupa id).
@@ -143,15 +224,36 @@ async function materialize(sel, ids) {
     if (r.kind === 'file' && r.bytes) {
       files.push({ name: r.name, getBytes: async () => r.bytes });
     } else if (r.kind === 'file' && r.href) {
-      const res = await fetchResource(r.href);
-      const name = nameFromDisposition(res.disposition, baseName(res.finalUrl) || `${r.label}.pdf`);
-      files.push({ name, getBytes: async () => res.buffer });
+      try {
+        const res = await fetchResource(r.href);
+        const name = nameFromDisposition(res.disposition, baseName(res.finalUrl) || `${r.label}.pdf`);
+        // enumerare: site-ul poate da pagina de eroare cu 200 -> pastreaza doar daca e chiar PDF
+        if (r.tolerant && !(res.contentType.includes('pdf') || /\.pdf$/i.test(name))) continue;
+        files.push({ name, getBytes: async () => res.buffer });
+      } catch (e) {
+        if (!r.tolerant) throw e; // enumerare: sarim peste variantele care dau 404
+      }
     } else if (r.kind === 'zip' && r.href) {
       const res = await fetchResource(r.href);
       const zip = new AdmZip(res.buffer);
       for (const e of zip.getEntries()) {
         if (e.isDirectory || !/\.pdf$/i.test(e.entryName)) continue;
         files.push({ name: path.posix.basename(e.entryName), getBytes: async () => e.getData() });
+      }
+    } else if (r.kind === 'page' && r.href) {
+      // urmareste sub-pagina si ia fisierele de descarcat de acolo
+      if (files.length >= 120) continue;
+      const pr = await fetchResource(r.href);
+      const phtml = pr.buffer.toString('utf8');
+      const plinks = extractLinks(phtml, baseHref(phtml, pr.finalUrl)).filter((l) => !/download selected|selectate|select all|adaug/i.test(l.label));
+      for (const l of plinks.slice(0, 20)) {
+        if (files.length >= 120) break;
+        try {
+          const rr = await fetchResource(l.href);
+          if (!(rr.contentType.includes('pdf') || /\.pdf$/i.test(l.href))) continue;
+          const name = nameFromDisposition(rr.disposition, baseName(rr.finalUrl) || `${l.label}.pdf`);
+          files.push({ name, getBytes: async () => rr.buffer });
+        } catch { /* sari peste fisierele care dau 404 */ }
       }
     }
   }
@@ -174,7 +276,7 @@ async function gatherFiles(startUrl, subjectSlug) {
     return { files: [{ name, getBytes: async () => res.buffer, sourceUrl: startUrl }], source: startUrl };
   }
   const html = res.buffer.toString('utf8');
-  const links = extractLinks(html, res.finalUrl);
+  const links = extractLinks(html, baseHref(html, res.finalUrl));
   const key = { matematica: 'matematica', informatica: 'informatica', fizica: 'fizica', romana: 'romana' }[subjectSlug] || subjectSlug || '';
   const zipLinks = links.filter((l) => /\.zip($|\?)/i.test(l.href));
   const pdfLinks = links.filter((l) => !/\.zip($|\?)/i.test(l.href));

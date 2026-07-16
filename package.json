@@ -1,10 +1,10 @@
 {
-  "name": "smartlearn-ai-server",
+  "name": "smartlearn-import-server",
   "version": "1.0.0",
-  "description": "Server AI (RAG + Gemini) pentru platforma SmartLearning",
-  "main": "ai-rag.js",
+  "description": "Server de import subiecte BAC pentru platforma SmartLearning",
+  "main": "import/server.js",
   "scripts": {
-    "start": "node ai-rag.js"
+    "start": "node import/server.js"
   },
   "engines": {
     "node": ">=18"
@@ -17,6 +17,7 @@
     "express": "^4.21.0",
     "mammoth": "^1.12.0",
     "officeparser": "^7.2.3",
+    "pdf-lib": "^1.17.1",
     "pdf-parse": "^2.4.5"
   }
 }

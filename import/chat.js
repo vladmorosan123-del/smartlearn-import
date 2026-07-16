@@ -30,6 +30,10 @@ function coarsePick(items, message) {
 
   const picked = items.filter((it) => {
     const l = normalize(it.label);
+    if (it.kind === 'page') {
+      // paginile sunt containere (materia e INAUNTRU) -> filtreaza doar pe an; AI-ul cauta dupa ce intra
+      return !year || l.includes(year);
+    }
     if (year && !l.includes(year)) return false;
     if (subjWanted.length && !subjWanted.some((s) => SUBJECT_KEYS[s].some((k) => l.includes(k)))) return false;
     return true;
@@ -42,17 +46,51 @@ function coarsePick(items, message) {
 
 // sinonime uzuale ca fallback-ul sa „inteleaga" mai mult limbaj natural
 const PROFILE_SYNONYMS = {
-  'mate-info': ['mate-info', 'mate info', 'matematica-informatica', 'matematica informatica', 'mate/info'],
+  // "real" = profilul real = mate-info + st-nat (ambele stiintifice)
+  'mate-info': ['mate-info', 'mate info', 'matematica-informatica', 'matematica informatica', 'mate/info', 'real'],
   'st-nat': ['st-nat', 'st nat', 'stiinte', 'stiintele naturii', 'stiinte ale naturii', 'real'],
   tehnologic: ['tehnologic', 'tehnic'],
   pedagogic: ['pedagogic', 'pedagog'],
+  // la FIZICA "real" = profilul teoretic (nu tehnologic)
+  real: ['real', 'teoretic', 'teoretica'],
+  uman: ['uman', 'umanist', 'umanistic'],
 };
+
+// Profilul e scris diferit in nume de la o materie la alta:
+//   fizica: "real" apare ca "teoretic"; romana: "real"/"uman" apar ca atare
+//   (grija: la romana exista si "teoretic_umanist", deci NU folosim "teoretic" pt real aici).
+const SPEC_TOKENS = {
+  fizica: { real: ['teoretic', 'real'], tehnologic: ['tehnologic', 'tehnic'] },
+  romana: { real: ['real'], uman: ['uman', 'umanist'] },
+};
+function specSynonyms(subject, spec) {
+  if (!spec) return null;
+  const bySubj = SPEC_TOKENS[subject];
+  if (bySubj && bySubj[spec]) return bySubj[spec];
+  return PROFILE_SYNONYMS[spec] || [spec];
+}
+
+// limbaj de programare cerut (informatica): C/C++ vs Pascal
+function langFromQuery(q) {
+  if (/\bpascal\b/.test(q)) return 'pascal';
+  if (/c\/?c?\+\+|\bcpp\b|limbaj(ul)?\s+c\b|\b(in|pe|cu)\s+c\b/.test(q)) return 'c';
+  return null;
+}
+// limbajul unui fisier de informatica din numele lui (baremul n-are limbaj -> null)
+function langOfMaterial(m) {
+  if (m.subject !== 'informatica') return null;
+  const n = normalize(m.file_name || '');
+  if (/pascal/.test(n)) return 'pascal';
+  if (/_c_|_cpp|c\+\+/.test(n)) return 'c';
+  return null;
+}
 
 // ── FINE determinist (fallback) ──────────────────────────────
 function refineByMessage(materials, message) {
   const q = normalize(message);
 
   const profWanted = PROFILES.filter((p) => (PROFILE_SYNONYMS[p] || [p]).some((s) => q.includes(s)));
+  const langWanted = langFromQuery(q);
 
   let onlySubiecte = /(doar|numai)\s+subiect|fara\s+barem|fara\s+rezolvar/.test(q);
   let onlyBareme = /(doar|numai)\s+(barem|rezolvar|solut|raspuns)|\b(baremele|rezolvarile|solutiile)\b/.test(q);
@@ -70,6 +108,11 @@ function refineByMessage(materials, message) {
   let out = materials.filter((m) => {
     const l = normalize(`${m.file_name || ''} ${m.profil || ''}`);
     if (profWanted.length && !profWanted.some((p) => l.includes(p))) return false;
+    // limbaj: exclude subiectele in alt limbaj; baremul (fara limbaj) ramane, se leaga de subiect
+    if (langWanted) {
+      const ml = langOfMaterial(m);
+      if (ml && ml !== langWanted) return false;
+    }
     if (onlySubiecte && m.tip === 'barem') return false;
     if (onlyBareme && m.tip !== 'barem') return false;
     return true;
@@ -78,26 +121,79 @@ function refineByMessage(materials, message) {
   return out;
 }
 
+// Cererea are criterii clare (limbaj / specializare / doar-subiecte-bareme / limita)?
+// Atunci filtram DETERMINIST — sigur, previzibil, fara sa depinda de cota AI.
+function hasStructuredFilters(q) {
+  if (langFromQuery(q)) return true;
+  if (PROFILES.some((p) => (PROFILE_SYNONYMS[p] || [p]).some((s) => q.includes(s)))) return true;
+  if (/(doar|numai)\s+(subiect|barem|rezolvar|solut)/.test(q)) return true;
+  if (/\b(subiecte(le)?|bareme(le)?|rezolvarile|solutiile)\b/.test(q)) return true;
+  if (/primele\s+\d+|\b\d+\s+(subiect|barem|model|fisier|variant)/.test(q)) return true;
+  return false;
+}
+
+function replyFor(chosen) {
+  const s = chosen.filter((m) => m.tip === 'subiect').length;
+  const b = chosen.length - s;
+  if (!chosen.length) return 'Nu am găsit fișiere care să se potrivească exact.';
+  const parts = [s ? `${s} subiecte` : '', b ? `${b} bareme` : ''].filter(Boolean);
+  return `Am ales exact ce ai cerut: ${parts.join(' + ')}`;
+}
+
+// ── FILTRARE STRUCTURATA: din butoanele barei (materie/an/specializare/limbaj/tip) ──
+// Determinist 100%, fara AI. f = { subject, year, specializare, limbaj, tip }
+function filterByStructured(materials, f) {
+  f = f || {};
+  const langWanted = f.limbaj ? (/pascal/i.test(f.limbaj) ? 'pascal' : 'c') : null;
+  const syns = specSynonyms(f.subject, f.specializare);
+  const yearW = f.year ? String(f.year) : null; // gol => toti anii
+  const tip = f.tip || 'ambele';
+  return materials.filter((m) => {
+    if (f.subject && m.subject && m.subject !== f.subject) return false;
+    if (yearW && String(m.year || '') !== yearW) return false;
+    if (syns) {
+      const l = normalize(`${m.file_name || ''} ${m.profil || ''}`);
+      if (!syns.some((s) => l.includes(s))) return false;
+    }
+    if (langWanted) {
+      const ml = langOfMaterial(m); // baremul (fara limbaj) => null => trece, ca sa se lege
+      if (ml && ml !== langWanted) return false;
+    }
+    if (tip === 'subiecte' && m.tip === 'barem') return false;
+    if (tip === 'bareme' && m.tip !== 'barem') return false;
+    return true;
+  });
+}
+
 // ── FINE cu AI: Gemini alege din fisierele reale + reply ─────
 async function aiRefine(materials, message, history) {
+  const q = normalize(message);
+  if (hasStructuredFilters(q)) {
+    const chosen = refineByMessage(materials, message);
+    return { reply: replyFor(chosen), chosen };
+  }
   try {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) throw new Error('fara cheie');
     const { GoogleGenAI } = require('@google/genai');
     const ai = new GoogleGenAI({ apiKey });
 
-    const lista = materials.map((m, i) => `${i}: ${m.title}`).join('\n');
+    const lista = materials.map((m, i) => `${i}: [${m.tip}] ${m.title}`).join('\n');
     const sys =
-      'Esti asistentul unui profesor care importa subiecte de BAC. Ai o lista numerotata de fisiere (index: descriere). ' +
-      'Alege indecsii care se potrivesc cererii profesorului, INTELEGAND limbajul natural: profiluri ' +
-      '(mate-info, st-nat = stiintele naturii / "real", tehnologic, pedagogic), subiect vs barem (rezolvari), ' +
-      'cantitati ("primele 2", "doar unul"). Daca cere "toate", alege tot. ' +
+      'Esti asistentul unui profesor care importa subiecte de BAC. Ai o lista numerotata de fisiere (index: [subiect|barem] descriere). ' +
+      'Alege indecsii care se potrivesc cererii profesorului, INTELEGAND limbajul natural: profiluri/specializari ' +
+      '(mate-info = Mate-Info; st-nat = Stiintele naturii; "profilul real" = mate-info SI st-nat impreuna; tehnologic; pedagogic), subiect vs barem (rezolvari), ' +
+      'cantitati ("primele 2", "doar unul"), ani ("din toti anii"/"toate" = NU filtra dupa an). ' +
+      'La informatica titlurile arata limbajul: C/C++ sau Pascal. Daca profesorul cere C/C++, alege DOAR subiectele C/C++ (nu cele Pascal); daca cere Pascal, invers. ' +
+      'ATENTIE: baremele NU au limbaj in titlu (sunt comune) — cand ceri un limbaj, INCLUDE si baremele variantelor alese, ca sa se lege de subiect. ' +
+      'Alege TOATE fisierele care se potrivesc exact cererii (nu limita numarul daca profesorul nu cere o limita). ' +
       'Raspunde DOAR cu JSON: {"reply":"o propozitie prietenoasa in romana despre ce ai ales", "idx":[numere]}.';
     const hist = (history || []).slice(-6).map((h) => `${h.role}: ${h.content}`).join('\n');
     const contents = `FISIERE:\n${lista}\n\nISTORIC:\n${hist}\n\nMESAJ: "${message}"`;
     const config = { systemInstruction: sys, maxOutputTokens: 1024, responseMimeType: 'application/json' };
 
-    const models = ['gemini-2.5-flash-lite', 'gemini-2.5-flash'];
+    // aliasurile "latest" au cota separata de modelele fixe (des epuizate pe planul gratuit)
+    const models = ['gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-2.5-flash-lite'];
     let result, lastErr;
     for (const model of models) {
       try { result = await ai.models.generateContent({ model, contents, config }); break; }
@@ -116,4 +212,4 @@ async function aiRefine(materials, message, history) {
   }
 }
 
-module.exports = { coarsePick, refineByMessage, aiRefine };
+module.exports = { coarsePick, refineByMessage, aiRefine, filterByStructured };
