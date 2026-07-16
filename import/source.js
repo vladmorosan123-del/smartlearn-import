@@ -12,7 +12,14 @@
 const path = require('path');
 const AdmZip = require('adm-zip');
 
-const UA = 'Mozilla/5.0 (SmartLearning import bot)';
+// UA de browser real + headere ro — unele site-uri (pbinfo, gov) dau 403 la UA-uri "bot"
+// sau la cereri care nu par de browser romanesc, mai ales de pe IP-uri de datacenter.
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+const BROWSER_HEADERS = {
+  'User-Agent': UA,
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7',
+};
 
 function normalize(s) {
   return String(s || '')
@@ -57,7 +64,7 @@ function enumerateVariants(pdfLinks, max = 120) {
 }
 
 async function fetchResource(url) {
-  const r = await fetch(url, { headers: { 'User-Agent': UA }, redirect: 'follow' });
+  const r = await fetch(url, { headers: BROWSER_HEADERS, redirect: 'follow' });
   if (!r.ok) throw new Error(`GET ${url} -> ${r.status}`);
   const buffer = Buffer.from(await r.arrayBuffer());
   return {
@@ -71,7 +78,7 @@ async function fetchResource(url) {
 // numele real al unui fisier fara extensie in URL (din Content-Disposition), cu un GET minimal
 async function resolveName(href) {
   try {
-    const r = await fetch(href, { headers: { 'User-Agent': UA, Range: 'bytes=0-0' }, redirect: 'follow' });
+    const r = await fetch(href, { headers: { ...BROWSER_HEADERS, Range: 'bytes=0-0' }, redirect: 'follow' });
     const name = nameFromDisposition(r.headers.get('content-disposition') || '', null);
     return name && /\.(pdf|zip|docx?)$/i.test(name) ? name : null;
   } catch { return null; }
