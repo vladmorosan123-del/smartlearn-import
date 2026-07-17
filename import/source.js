@@ -15,11 +15,39 @@ const AdmZip = require('adm-zip');
 // UA de browser real + headere ro — unele site-uri (pbinfo, gov) dau 403 la UA-uri "bot"
 // sau la cereri care nu par de browser romanesc, mai ales de pe IP-uri de datacenter.
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+// Set complet de headere ca ale unui Chrome real — multe site-uri dau 403 daca lipsesc
+// Sec-Fetch / Sec-Ch-Ua (semnul unei cereri "reale" de browser, nu de bot/script).
 const BROWSER_HEADERS = {
   'User-Agent': UA,
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf,image/avif,image/webp,*/*;q=0.8',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf,image/avif,image/webp,image/apng,*/*;q=0.8',
   'Accept-Language': 'ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Sec-Ch-Ua': '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+  'Sec-Ch-Ua-Mobile': '?0',
+  'Sec-Ch-Ua-Platform': '"Windows"',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1',
 };
+
+// fetch cu timeout (ca site-urile lente sa nu blocheze) + o reincercare la erori de retea (nu la 403).
+async function fetchWithRetry(url, extraHeaders = {}, tries = 2, timeoutMs = 25000) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      return await fetch(url, { headers: { ...BROWSER_HEADERS, ...extraHeaders }, redirect: 'follow', signal: ctrl.signal });
+    } catch (e) {
+      lastErr = e;
+      if (i < tries - 1) await new Promise((r) => setTimeout(r, 800)); // scurt, apoi reincearca
+    } finally {
+      clearTimeout(t);
+    }
+  }
+  throw lastErr;
+}
 
 function normalize(s) {
   return String(s || '')
@@ -66,7 +94,7 @@ function enumerateVariants(pdfLinks, max = 120) {
 async function fetchResource(url) {
   let r;
   try {
-    r = await fetch(url, { headers: BROWSER_HEADERS, redirect: 'follow' });
+    r = await fetchWithRetry(url);
   } catch (e) {
     // scoate cauza reala din spatele "fetch failed" (TLS, timeout, refuz conexiune, geo)
     const c = e && e.cause;
@@ -86,7 +114,7 @@ async function fetchResource(url) {
 // numele real al unui fisier fara extensie in URL (din Content-Disposition), cu un GET minimal
 async function resolveName(href) {
   try {
-    const r = await fetch(href, { headers: { ...BROWSER_HEADERS, Range: 'bytes=0-0' }, redirect: 'follow' });
+    const r = await fetchWithRetry(href, { Range: 'bytes=0-0' }, 1, 12000);
     const name = nameFromDisposition(r.headers.get('content-disposition') || '', null);
     return name && /\.(pdf|zip|docx?)$/i.test(name) ? name : null;
   } catch { return null; }
