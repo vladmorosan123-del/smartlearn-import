@@ -31,8 +31,9 @@ const BROWSER_HEADERS = {
   'Upgrade-Insecure-Requests': '1',
 };
 
-// fetch cu timeout (ca site-urile lente sa nu blocheze) + o reincercare la erori de retea (nu la 403).
-async function fetchWithRetry(url, extraHeaders = {}, tries = 2, timeoutMs = 25000) {
+// fetch cu timeout (ca site-urile lente sa nu blocheze). Fail-fast: fara retry implicit,
+// altfel pe scraping cu sute de linkuri fiecare link mort ar dubla timpul.
+async function fetchWithRetry(url, extraHeaders = {}, tries = 1, timeoutMs = 15000) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
     const ctrl = new AbortController();
@@ -259,8 +260,44 @@ function extractSubPages(html, baseUrl) {
 }
 
 // Descarca/extrage efectiv doar elementele alese (dupa id).
+// Intra recursiv intr-o pagina si aduna PDF-urile, coborand pana la 3 niveluri
+// (categorie -> an -> postare -> PDF). Limite ca sa nu explodeze pe site-uri mari.
+async function drillPage(url, files, seen, depth) {
+  if (files.length >= 120 || seen.has(url) || seen.size > 70 || depth > 2) return;
+  seen.add(url);
+  let pr;
+  try { pr = await fetchResource(url); } catch { return; }
+  if (pr.contentType.includes('pdf')) { // url-ul era chiar un PDF
+    files.push({ name: nameFromDisposition(pr.disposition, baseName(pr.finalUrl) || 'fisier.pdf'), getBytes: async () => pr.buffer });
+    return;
+  }
+  const html = pr.buffer.toString('utf8');
+  const base = baseHref(html, pr.finalUrl);
+  const before = files.length;
+  // ca inainte: linkurile paginii — intai cele care par fisiere, apoi restul; pastreaza PDF-urile
+  const links = extractLinks(html, base).filter((l) => !/download selected|selectate|select all|adaug/i.test(l.label));
+  const looksFile = (l) => /\.pdf($|\?)/i.test(l.href) || /\/file(\/|$|\?)/i.test(l.href) || /descarc|download|fi[șs]ier|subiect|barem/i.test(l.label);
+  const ordered = [...links.filter(looksFile), ...links.filter((l) => !looksFile(l))];
+  for (const l of ordered.slice(0, 20)) {
+    if (files.length >= 120) break;
+    try {
+      const rr = await fetchResource(l.href);
+      if (!(rr.contentType.includes('pdf') || /\.pdf$/i.test(l.href))) continue;
+      files.push({ name: nameFromDisposition(rr.disposition, baseName(rr.finalUrl) || `${l.label}.pdf`), getBytes: async () => rr.buffer });
+    } catch { /* sari peste linkurile moarte */ }
+  }
+  // DOAR daca pagina asta n-a dat niciun fisier -> coboara mai adanc (recursiv)
+  if (files.length === before && depth < 2) {
+    for (const s of extractSubPages(html, base).slice(0, 12)) {
+      if (files.length >= 120) break;
+      await drillPage(s.href, files, seen, depth + 1);
+    }
+  }
+}
+
 async function materialize(sel, ids) {
   const files = [];
+  const seenPages = new Set(); // partajat, sa nu revizitam aceeasi pagina
   for (const id of ids) {
     const r = sel._resolve[id];
     if (!r) continue;
@@ -284,20 +321,9 @@ async function materialize(sel, ids) {
         files.push({ name: path.posix.basename(e.entryName), getBytes: async () => e.getData() });
       }
     } else if (r.kind === 'page' && r.href) {
-      // urmareste sub-pagina si ia fisierele de descarcat de acolo
+      // urmareste sub-pagina RECURSIV (pana la 3 niveluri) si ia fisierele de acolo
       if (files.length >= 120) continue;
-      const pr = await fetchResource(r.href);
-      const phtml = pr.buffer.toString('utf8');
-      const plinks = extractLinks(phtml, baseHref(phtml, pr.finalUrl)).filter((l) => !/download selected|selectate|select all|adaug/i.test(l.label));
-      for (const l of plinks.slice(0, 20)) {
-        if (files.length >= 120) break;
-        try {
-          const rr = await fetchResource(l.href);
-          if (!(rr.contentType.includes('pdf') || /\.pdf$/i.test(l.href))) continue;
-          const name = nameFromDisposition(rr.disposition, baseName(rr.finalUrl) || `${l.label}.pdf`);
-          files.push({ name, getBytes: async () => rr.buffer });
-        } catch { /* sari peste fisierele care dau 404 */ }
-      }
+      await drillPage(r.href, files, seenPages, 0);
     }
   }
   return files;
